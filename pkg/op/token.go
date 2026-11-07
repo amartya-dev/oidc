@@ -146,7 +146,7 @@ func CreateJWT(ctx context.Context, issuer string, tokenRequest TokenRequest, ex
 	ctx, span := Tracer.Start(ctx, "CreateJWT")
 	defer span.End()
 
-	claims := oidc.NewAccessTokenClaims(issuer, tokenRequest.GetSubject(), tokenRequest.GetAudience(), exp, id, client.GetID(), client.ClockSkew())
+	claims := oidc.NewAccessTokenClaims(issuer, tokenRequest.GetSubject(), AccessTokenAudience(tokenRequest), exp, id, client.GetID(), client.ClockSkew())
 	if client != nil {
 		restrictedScopes := client.RestrictAdditionalAccessTokenScopes()(tokenRequest.GetScopes())
 
@@ -196,6 +196,20 @@ type IDTokenRequest interface {
 	GetClientID() string
 	GetScopes() []string
 	GetSubject() string
+}
+
+// AccessTokenAudience returns the audience the access token is issued for: the
+// audience reported through [AccessTokenAudienceRequest] when the request
+// implements it, otherwise the request audience.
+//
+// [CreateJWT] uses it for the `aud` claim. Storage implementations SHOULD use
+// it as well when they persist the audience of an access token, so that opaque
+// tokens and introspection responses carry the same audience JWTs would.
+func AccessTokenAudience(tokenRequest TokenRequest) []string {
+	if request, ok := tokenRequest.(AccessTokenAudienceRequest); ok {
+		return request.GetAccessTokenAudience()
+	}
+	return tokenRequest.GetAudience()
 }
 
 func CreateIDToken(ctx context.Context, issuer string, request IDTokenRequest, validity time.Duration, accessToken, code string, storage Storage, client Client) (string, error) {

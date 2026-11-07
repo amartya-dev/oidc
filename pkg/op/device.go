@@ -101,6 +101,17 @@ func createDeviceAuthorization(ctx context.Context, req *oidc.DeviceAuthorizatio
 		return nil, NewStatusError(err, http.StatusInternalServerError)
 	}
 
+	// When the provider advertises support for resource indicators, an explicit
+	// `resource` must not be silently dropped before the user approves the
+	// request: without the stored grant, no later token request could be
+	// checked or narrowed correctly.
+	if len(req.Resource) > 0 {
+		if _, ok := storage.(CanStoreDeviceAuthorizationWithResources); !ok && advertisesResourceIndicators(o) {
+			return nil, oidc.ErrInvalidTarget().
+				WithDescription("device authorization storage does not support resource indicators")
+		}
+	}
+
 	expires := time.Now().Add(config.Lifetime)
 	if resourceStorage, ok := storage.(CanStoreDeviceAuthorizationWithResources); ok {
 		err = resourceStorage.StoreDeviceAuthorizationWithResources(ctx, clientID, deviceCode, userCode, expires, req.Scopes, req.Resource)
@@ -108,6 +119,14 @@ func createDeviceAuthorization(ctx context.Context, req *oidc.DeviceAuthorizatio
 		err = storage.StoreDeviceAuthorization(ctx, clientID, deviceCode, userCode, expires, req.Scopes)
 	}
 	if err != nil {
+		// A storage refusal already described by an OAuth error (such as
+		// invalid_target for a resource outside the client policy) must keep
+		// its type so the HTTP layer maps it to the status the standard
+		// specifies. Only genuine internal failures default to 500.
+		var oidcErr *oidc.Error
+		if errors.As(err, &oidcErr) {
+			return nil, err
+		}
 		return nil, NewStatusError(err, http.StatusInternalServerError)
 	}
 
@@ -235,7 +254,7 @@ func deviceAccessToken(w http.ResponseWriter, r *http.Request, exchanger Exchang
 	if err != nil {
 		return err
 	}
-	if err = ValidateTokenRequestResources(req.Resource, tokenRequest); err != nil {
+	if err = validateTokenRequestResources(exchanger, req.Resource, tokenRequest); err != nil {
 		return err
 	}
 
@@ -278,13 +297,18 @@ type DeviceAuthorizationState struct {
 
 	// Resource holds the resource indicators of [RFC 8707] that were requested with
 	// the device authorization request, as far as the [DeviceAuthorizationStorage]
-	// implementation stores and returns them. When the device access token request
-	// narrows them with its own `resource` parameter, this field is reduced to the
-	// requested subset before the tokens are created, so that the [Storage]
-	// implementation can bind the audience of the issued tokens to it.
+	// implementation stores and returns them. It is the original grant and stays
+	// untouched when a device access token request narrows it down with its own
+	// `resource` parameter; the narrowed selection is kept apart, see
+	// currentResources.
 	//
 	// [RFC 8707]: https://www.rfc-editor.org/rfc/rfc8707
 	Resource []string
+
+	// currentResources holds the narrowed `resource` selection of the current
+	// device access token request, as received through SetCurrentResources.
+	// It is nil when the token request did not narrow the grant down.
+	currentResources []string
 
 	// The following fields are populated after Done == true
 	Subject  string
@@ -315,14 +339,52 @@ func (r *DeviceAuthorizationState) GetScopes() []string {
 	return r.Scopes
 }
 
-// GetResource implements the [ResourceRequest] interface.
+// GetResource implements the [ResourceRequest] interface. It reports the original
+// grant, which narrowing a token request never rewrites.
 func (r *DeviceAuthorizationState) GetResource() []string {
 	return r.Resource
 }
 
-// SetCurrentResources implements the [CurrentResourceSetter] interface.
+// GetCurrentResources implements the [CurrentResourceRequest] interface.
+// It reports the narrowed `resource` selection of the current token request, or nil
+// when the token request did not narrow the grant down.
+func (r *DeviceAuthorizationState) GetCurrentResources() []string {
+	return r.currentResources
+}
+
+// SetCurrentResources implements the [CurrentResourceSetter] interface. It only
+// records the narrowed selection for the current token request; the original grant
+// in Resource stays untouched.
 func (r *DeviceAuthorizationState) SetCurrentResources(resources []string) {
-	r.Resource = resources
+	r.currentResources = resources
+}
+
+// effectiveResources returns the narrowed `resource` selection of the current
+// token request when it narrowed the grant down, otherwise the full granted set.
+func (r *DeviceAuthorizationState) effectiveResources() []string {
+	if r.currentResources != nil {
+		return r.currentResources
+	}
+	return r.Resource
+}
+
+// GetAccessTokenAudience implements the [AccessTokenAudienceRequest] interface.
+// It binds the access token audience to the effective resource selection of the
+// current token request, keeping the client as an audience as GetAudience does.
+// When the flow does not use resources, it falls back to GetAudience.
+func (r *DeviceAuthorizationState) GetAccessTokenAudience() []string {
+	effective := r.effectiveResources()
+	if len(effective) == 0 {
+		return r.GetAudience()
+	}
+	audience := make([]string, 0, len(effective)+1)
+	audience = append(audience, r.ClientID)
+	for _, resource := range effective {
+		if !slices.Contains(audience, resource) {
+			audience = append(audience, resource)
+		}
+	}
+	return audience
 }
 
 func (r *DeviceAuthorizationState) GetSubject() string {
@@ -349,12 +411,26 @@ func CheckDeviceAuthorizationState(ctx context.Context, clientID, deviceCode str
 		return state, oidc.ErrAccessDenied()
 	}
 	if state.Done {
-		return state, nil
+		return copyDeviceAuthorizationState(state), nil
 	}
 	if time.Now().After(state.Expires) {
 		return state, oidc.ErrExpiredDeviceCode()
 	}
 	return state, oidc.ErrAuthorizationPending()
+}
+
+// copyDeviceAuthorizationState returns a per-request copy of a stored device
+// authorization state, so that narrowing the state for one token request (see
+// SetCurrentResources) never mutates the state kept by the Storage
+// implementation, which may serve further polls of the same device code.
+func copyDeviceAuthorizationState(state *DeviceAuthorizationState) *DeviceAuthorizationState {
+	copied := *state
+	copied.Audience = slices.Clone(state.Audience)
+	copied.Scopes = slices.Clone(state.Scopes)
+	copied.Resource = slices.Clone(state.Resource)
+	copied.currentResources = slices.Clone(state.currentResources)
+	copied.AMR = slices.Clone(state.AMR)
+	return &copied
 }
 
 func CreateDeviceTokenResponse(ctx context.Context, tokenRequest TokenRequest, creator TokenCreator, client Client) (*oidc.AccessTokenResponse, error) {

@@ -270,7 +270,7 @@ func TestValidateAuthRequest(t *testing.T) {
 				Resource:     []string{"https://mcp.example.com/mcp#fragment"},
 			}, mock.NewMockStorageExpectValidClientID(t), nil},
 			oidc.ErrInvalidTarget().WithDescription(
-				"The resource parameter %q must not include a fragment component.",
+				"resource parameter %q must not include a fragment component",
 				"https://mcp.example.com/mcp#fragment",
 			),
 		},
@@ -913,11 +913,11 @@ func TestCopyRequestObjectToAuthRequest(t *testing.T) {
 	}
 
 	op.CopyRequestObjectToAuthRequest(authReq, requestObject)
-	assert.Equal(t, []string{"https://mcp.example.com/mcp"}, authReq.Resource)
+	assert.Equal(t, oidc.ResourceIndicators{"https://mcp.example.com/mcp"}, authReq.Resource)
 
 	// an empty resource in the request object must not clear the request parameter
 	op.CopyRequestObjectToAuthRequest(authReq, &oidc.RequestObject{})
-	assert.Equal(t, []string{"https://mcp.example.com/mcp"}, authReq.Resource)
+	assert.Equal(t, oidc.ResourceIndicators{"https://mcp.example.com/mcp"}, authReq.Resource)
 }
 
 func TestRedirectToLogin(t *testing.T) {

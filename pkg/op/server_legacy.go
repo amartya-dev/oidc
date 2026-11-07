@@ -174,7 +174,12 @@ func (s *LegacyServer) DeviceAuthorization(ctx context.Context, r *ClientRequest
 
 	response, err := createDeviceAuthorization(ctx, r.Data, r.Client.GetID(), s.provider)
 	if err != nil {
-		return nil, AsStatusError(err, http.StatusInternalServerError)
+		// Return the error unwrapped, like DeviceToken does: OAuth errors
+		// (invalid_target, invalid_request, ...) map to the status the
+		// standard specifies, while internal failures still surface as 500
+		// through WriteError. Forcing 500 here would misreport every OAuth
+		// refusal from createDeviceAuthorization.
+		return nil, err
 	}
 	return NewResponse(response), nil
 }
@@ -241,7 +246,7 @@ func (s *LegacyServer) CodeExchange(ctx context.Context, r *ClientRequest[oidc.A
 	if r.Data.RedirectURI != authReq.GetRedirectURI() {
 		return nil, oidc.ErrInvalidGrant().WithDescription("redirect_uri does not correspond")
 	}
-	if err = ValidateTokenRequestResources(r.Data.Resource, authReq); err != nil {
+	if err = validateTokenRequestResources(s.provider, r.Data.Resource, authReq); err != nil {
 		return nil, err
 	}
 	resp, err := CreateTokenResponse(ctx, authReq, r.Client, s.provider, true, r.Data.Code, "")
@@ -268,7 +273,7 @@ func (s *LegacyServer) RefreshToken(ctx context.Context, r *ClientRequest[oidc.R
 	if err = ValidateRefreshTokenScopes(r.Data.Scopes, request); err != nil {
 		return nil, err
 	}
-	if err = ValidateTokenRequestResources(r.Data.Resource, request); err != nil {
+	if err = validateTokenRequestResources(s.provider, r.Data.Resource, request); err != nil {
 		return nil, err
 	}
 	resp, err := CreateTokenResponse(ctx, request, r.Client, s.provider, true, "", r.Data.RefreshToken)
@@ -332,7 +337,7 @@ func (s *LegacyServer) ClientCredentialsExchange(ctx context.Context, r *ClientR
 	if err != nil {
 		return nil, err
 	}
-	if err = ValidateTokenRequestResources(r.Data.Resource, tokenRequest); err != nil {
+	if err = validateTokenRequestResources(s.provider, r.Data.Resource, tokenRequest); err != nil {
 		return nil, err
 	}
 	resp, err := CreateClientCredentialsTokenResponse(ctx, tokenRequest, s.provider, r.Client)
@@ -358,7 +363,7 @@ func (s *LegacyServer) DeviceToken(ctx context.Context, r *ClientRequest[oidc.De
 	if err != nil {
 		return nil, err
 	}
-	if err = ValidateTokenRequestResources(r.Data.Resource, tokenRequest); err != nil {
+	if err = validateTokenRequestResources(s.provider, r.Data.Resource, tokenRequest); err != nil {
 		return nil, err
 	}
 	resp, err := CreateDeviceTokenResponse(ctx, tokenRequest, s.provider, r.Client)

@@ -89,11 +89,54 @@ type resourceRequest struct {
 	currentResources []string
 }
 
+var _ op.CurrentResourceRequest = (*resourceRequest)(nil)
+var _ op.AccessTokenAudienceRequest = (*resourceRequest)(nil)
+
 func (r *resourceRequest) GetSubject() string    { return "id1" }
 func (r *resourceRequest) GetAudience() []string { return []string{"client1"} }
 func (r *resourceRequest) GetScopes() []string   { return []string{"openid"} }
 func (r *resourceRequest) GetResource() []string { return r.resources }
+func (r *resourceRequest) GetCurrentResources() []string {
+	return r.currentResources
+}
 func (r *resourceRequest) SetCurrentResources(resources []string) {
+	r.currentResources = resources
+}
+func (r *resourceRequest) GetAccessTokenAudience() []string { return []string{"client1"} }
+
+// grantOnlyRequest reports a grant but cannot receive a narrowed selection.
+type grantOnlyRequest struct {
+	resources []string
+}
+
+func (r *grantOnlyRequest) GetSubject() string    { return "id1" }
+func (r *grantOnlyRequest) GetAudience() []string { return []string{"client1"} }
+func (r *grantOnlyRequest) GetScopes() []string   { return []string{"openid"} }
+func (r *grantOnlyRequest) GetResource() []string { return r.resources }
+
+// setterOnlyRequest accepts a narrowed selection without any grant to check it against.
+type setterOnlyRequest struct {
+	currentResources []string
+}
+
+func (r *setterOnlyRequest) GetSubject() string    { return "id1" }
+func (r *setterOnlyRequest) GetAudience() []string { return []string{"client1"} }
+func (r *setterOnlyRequest) GetScopes() []string   { return []string{"openid"} }
+func (r *setterOnlyRequest) SetCurrentResources(resources []string) {
+	r.currentResources = resources
+}
+
+// grantAndSetterRequest checks and narrows but never reports the access audience.
+type grantAndSetterRequest struct {
+	resources        []string
+	currentResources []string
+}
+
+func (r *grantAndSetterRequest) GetSubject() string    { return "id1" }
+func (r *grantAndSetterRequest) GetAudience() []string { return []string{"client1"} }
+func (r *grantAndSetterRequest) GetScopes() []string   { return []string{"openid"} }
+func (r *grantAndSetterRequest) GetResource() []string { return r.resources }
+func (r *grantAndSetterRequest) SetCurrentResources(resources []string) {
 	r.currentResources = resources
 }
 
@@ -149,10 +192,19 @@ func TestValidateTokenRequestResources(t *testing.T) {
 			wantErr:   true,
 		},
 		{
-			name:        "nothing granted accepts any valid resource",
-			requested:   []string{"https://mcp.example.com/mcp"},
-			granted:     nil,
-			wantCurrent: []string{"https://mcp.example.com/mcp"},
+			// An absent grant must not authorize an arbitrary resource: the
+			// request implements ResourceRequest, so the subset rule applies
+			// and anything outside the (empty) grant is rejected.
+			name:      "nothing granted rejects any requested resource",
+			requested: []string{"https://mcp.example.com/mcp"},
+			granted:   nil,
+			wantErr:   true,
+		},
+		{
+			name:      "explicitly empty grant rejects any requested resource",
+			requested: []string{"https://mcp.example.com/mcp"},
+			granted:   []string{},
+			wantErr:   true,
 		},
 	}
 	for _, tt := range tests {
@@ -173,7 +225,80 @@ func TestValidateTokenRequestResources(t *testing.T) {
 	}
 }
 
+func TestValidateTokenRequestResourcesStrict(t *testing.T) {
+	const granted = "https://mcp.example.com/mcp"
+
+	newRequest := func() op.TokenRequest { return &resourceRequest{resources: []string{granted}} }
+
+	t.Run("no resource requested passes without capabilities", func(t *testing.T) {
+		require.NoError(t, op.ValidateTokenRequestResourcesStrict(nil, &plainRequest{}))
+	})
+
+	t.Run("request without grant report is rejected", func(t *testing.T) {
+		err := op.ValidateTokenRequestResourcesStrict([]string{granted}, &plainRequest{})
+		requireInvalidTarget(t, err)
+	})
+
+	t.Run("grant without narrowing delivery is rejected", func(t *testing.T) {
+		err := op.ValidateTokenRequestResourcesStrict(
+			[]string{granted}, &grantOnlyRequest{resources: []string{granted}})
+		requireInvalidTarget(t, err)
+	})
+
+	t.Run("narrowing delivery without grant is rejected", func(t *testing.T) {
+		setter := &setterOnlyRequest{}
+		err := op.ValidateTokenRequestResourcesStrict([]string{granted}, setter)
+		requireInvalidTarget(t, err)
+		assert.Nil(t, setter.currentResources, "rejected selection must not be delivered")
+	})
+
+	t.Run("missing access audience report is rejected", func(t *testing.T) {
+		partial := &grantAndSetterRequest{resources: []string{granted}}
+		err := op.ValidateTokenRequestResourcesStrict([]string{granted}, partial)
+		requireInvalidTarget(t, err)
+		assert.Nil(t, partial.currentResources, "rejected selection must not be delivered")
+	})
+
+	t.Run("granted resource is accepted and delivered", func(t *testing.T) {
+		request := newRequest()
+		require.NoError(t, op.ValidateTokenRequestResourcesStrict([]string{granted}, request))
+		assert.Equal(t, []string{granted}, request.(*resourceRequest).currentResources)
+		assert.Equal(t, []string{granted}, request.(*resourceRequest).resources, "grant stays stable")
+	})
+
+	t.Run("resource outside the grant is rejected without delivery", func(t *testing.T) {
+		request := newRequest()
+		err := op.ValidateTokenRequestResourcesStrict([]string{"https://other.example.com"}, request)
+		requireInvalidTarget(t, err)
+		assert.Nil(t, request.(*resourceRequest).currentResources)
+	})
+
+	t.Run("empty grant rejects any requested resource", func(t *testing.T) {
+		request := &resourceRequest{}
+		err := op.ValidateTokenRequestResourcesStrict([]string{granted}, request)
+		requireInvalidTarget(t, err)
+		assert.Nil(t, request.currentResources)
+	})
+
+	t.Run("invalid syntax is rejected", func(t *testing.T) {
+		err := op.ValidateTokenRequestResourcesStrict([]string{"/mcp"}, newRequest())
+		requireInvalidTarget(t, err)
+	})
+}
+
+func requireInvalidTarget(t *testing.T, err error) {
+	t.Helper()
+	require.Error(t, err)
+	var oidcErr *oidc.Error
+	require.ErrorAs(t, err, &oidcErr)
+	assert.Equal(t, oidc.InvalidTarget, oidcErr.ErrorType)
+}
+
 func TestValidateTokenRequestResources_withoutResourceInterfaces(t *testing.T) {
+	// A request implementing neither optional interface does not use the
+	// feature: syntactically valid resources are accepted for backwards
+	// compatibility but cannot narrow anything, while invalid syntax is
+	// still rejected.
 	require.NoError(t, op.ValidateTokenRequestResources(nil, &plainRequest{}))
 	require.NoError(t, op.ValidateTokenRequestResources([]string{"https://mcp.example.com/mcp"}, &plainRequest{}))
 	require.Error(t, op.ValidateTokenRequestResources([]string{"/mcp"}, &plainRequest{}))
